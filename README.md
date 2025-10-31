@@ -36,12 +36,249 @@ Our solution integrates multiple data sources:
    
 ### Methodology
 
-Our forecasting pipeline consists of:
+#  Full Mathematical Description of the Forecast Model
 
-1. **Data Processing**: Aggregate trade data to HS4 level, filter countries with sufficient product diversity
-2. **Feature Engineering**: Integrate economic indicators, exchange rates, and commodity prices
-3. **Model Training**: Ensemble of gradient boosting models (CatBoost, XGBoost, LightGBM)
-4. **Forecast Generation**: Predict October 2025 trade values for submission
+This document provides a **comprehensive mathematical explanation** of a forecasting model for **monthly trade values** by `(product × country × flow)`.
+
+The model combines **naive baselines**, **seasonal and trend decomposition**, **lagged exogenous variables**, and a **robust Huber regression correction**, with **special handling for short or rare series**.
+
+---
+
+## 0. Notation
+
+Let each series $s = (\text{product}, \text{country}, \text{flow})$ be observed monthly as:
+
+$$
+\{ (t_1, y_1), (t_2, y_2), ..., (t_T, y_T) \}, \quad y_t \ge 0
+$$
+
+We denote:
+- $M_t \in \{1,\dots,12\}$ the **month** of $t$  
+- $b_t$ the **base forecast**  
+- $\hat y_t$ the **final prediction**  
+- $x_t$ exogenous variables, possibly lagged
+
+---
+
+## 1. Base Forecast Candidates
+
+For each series, several naive forecast candidates are computed:
+
+1. **Last observed value**
+$$
+\text{last} = y_T
+$$
+
+2. **Same month last year**
+$$
+\text{seas12} = y_{T-12}, \quad \text{if available}
+$$
+
+3. **Moving averages**
+$$
+\text{ma3} = \frac{1}{3} \sum_{i=T-2}^{T} y_i, \quad
+\text{ma6} = \frac{1}{6} \sum_{i=T-5}^{T} y_i
+$$
+
+4. **Drift extrapolation**
+- Compute log-transformed slope over last 6 months:
+$$
+\beta = \frac{\sum_{i=T-5}^{T} (i-\bar i) (\log(1+y_i) - \overline{\log(1+y)} )}{\sum_{i=T-5}^{T} (i-\bar i)^2}
+$$
+- Extrapolated forecast:
+$$
+\text{drift_last} = y_T \cdot e^\beta
+$$
+
+5. **Seasonal-trend forecast** (see Section 2)
+
+6. **Same-month median of last 3 years**
+$$
+\text{same_month_med3} = \text{median}\{y_t : M_t = M_T, t \in \text{last 3 years}\}
+$$
+
+**Base forecast** $b_{T+1}$ is the median of all valid candidates:
+
+$$
+b_{T+1} = \text{median}\{\text{last}, \text{seas12}, \text{ma3}, \text{ma6}, \text{drift_last}, \text{seasonal_ST}, \text{same_month_med3}\}
+$$
+
+---
+
+## 2. Seasonal + Trend Decomposition
+
+Assume a multiplicative model:
+
+$$
+y_t \approx g \cdot S_{M_t} \cdot \text{trend}_t
+$$
+
+### 2.1 Seasonal factor $S_m$
+
+- Compute global scale $g$ as median of positive $y_t$ values:
+$$
+g = \text{median} \{ y_t : y_t > 0 \}
+$$
+- For each month $m$:
+$$
+S_m = \text{clip}\left( \frac{\text{median}\{y_t : M_t = m, y_t>0\}}{g}, 0.2, 5.0 \right)
+$$
+
+### 2.2 Deseasonalize and slope estimation
+
+- Deseasonalized series:
+$$
+d_t = \frac{y_t}{S_{M_t}}
+$$
+- Slope on log-space (small window $w$):
+$$
+\beta = \frac{\sum_{i=T-w+1}^{T} (i-\bar i) (\log(1 + d_i) - \overline{\log(1+d)})}{\sum_{i=T-w+1}^{T} (i-\bar i)^2}
+$$
+
+### 2.3 Forecast next month
+
+$$
+\hat d_{T+1} = d_T \cdot e^\beta, \quad
+\text{seasonal_ST} = \hat d_{T+1} \cdot S_{M_{T+1}}
+$$
+
+- Blend with same-month median and last value:
+$$
+\text{seasonal_ST} = \text{median}\{\text{seasonal_ST}, y_T, \text{same_month_med3}\}
+$$
+
+---
+
+## 3. Exogenous Variable Selection
+
+For candidate numeric exogenous variables $x_j$:
+
+1. For each lag $L \in \{1,3,6\}$:
+   - Form pairs $(x_{t-L}, y_t)$ over all series
+2. Compute Spearman correlation $\rho_{x_j, L}$
+3. Keep top `$k$` pairs $(x,L)$ with highest $|\rho_{x,L}|$
+
+These features are used in the Huber regression.
+
+---
+
+## 4. Feature Construction
+
+For each series and target month:
+
+| Feature | Formula / Description |
+|:--|:--|
+| Month | $M_{T+1}$ |
+| Binary month indicators | `is_jan`, `is_dec` |
+| Encodings | Mean target per product/country/flow: $\text{enc\_prod} = \text{mean}(y)$ for that product |
+| Seasonality | $S_{M_{T+1}}$ |
+| Lags | $y_T$, $y_{T-1}$, $y_{T-2}$, $y_{T-3}$, $y_{T-6}$, $y_{T-12}$ |
+| Exogenous | Selected top-$k$ lagged $x_j$ |
+| Optional: log slope | $\beta$ from deseasonalized last $w$ points |
+
+---
+
+## 5. Robust Correction: Huber Regression
+
+### 5.1 Target transformation
+
+Define relative correction in log-space:
+
+$$
+z_t = \log(1 + y_t) - \log(1 + b_t)
+$$
+
+- $b_t$ is base forecast
+- $z_t$ is the **residual correction**
+
+### 5.2 Model training
+
+- Stack all series and backtests
+- Train **HuberRegressor** to predict $z_t$ from features $X_t$:
+
+$$
+\hat z_{T+1} = f_{\text{Huber}}(X_{T+1})
+$$
+
+Huber loss:
+$$
+L_\delta(r) =
+\begin{cases}
+\frac{1}{2} r^2 & |r| \le \delta \\
+\delta (|r| - \frac{1}{2}\delta) & |r| > \delta
+\end{cases}, \quad r = z_t - \hat z_t
+$$
+
+---
+
+## 6. Final Forecast
+
+- Log-space corrected forecast:
+$$
+\hat y_{\text{corr}} = \exp(\log(1+b_{T+1}) + \hat z_{T+1}) - 1
+$$
+
+- For rare series (mostly zeros):
+$$
+y_{\text{corr}} = \max(y_{\text{floor}}, \min(\hat y_{\text{corr}}, y_{T} \cdot g_{\text{cap}}))
+$$
+
+- Weighted blend with base forecast:
+$$
+\hat y_{T+1} = w \cdot y_{\text{corr}} + (1-w) \cdot b_{T+1}, \quad w = 0.6
+$$
+
+---
+
+## 7. Rare Series Handling
+
+A series is considered rare if fraction of nonzero $y_t$:
+
+$$
+\frac{\#\{y_t>0\}}{T} < f_{\text{rare}}
+$$
+
+- Floor applied:
+$$
+y_{\text{floor}} = \text{median of last nonzero k values} \cdot f_{\text{floor}}
+$$
+- Cap growth:
+$$
+y_{\text{corr}} \le y_T \cdot g_{\text{cap}}
+$$
+
+---
+
+## 8. Evaluation: Micro sMAPE
+
+Global metric:
+$$
+\text{sMAPE} = 100 \cdot \frac{1}{N} \sum_{i=1}^{N} \frac{2 |y_i - \hat y_i|}{|y_i| + |\hat y_i| + \varepsilon}
+$$
+
+Top-20 metric: only top 20 countries per `(product × flow)` by **sum of trade_value**.
+
+---
+
+## 9. Summary of Model Flow
+
+1. **Split train/test**  
+2. **Identify series** `(product × country × flow)`  
+3. **Compute naive candidates** (last, MA, drift, seasonal, same-month median)  
+4. **Compute base forecast** $b$ = median(candidates)  
+5. **Compute seasonal-trend factors** $S_m$ and slope $\beta$  
+6. **Select exogenous features** by Spearman correlation  
+7. **Construct features**: lags, seasonality, encodings, exog  
+8. **Backtest and fit Huber regression** on $\log$ correction  
+9. **Predict next month**: apply Huber correction in log-space  
+10. **Rare series adjustment**: floor & growth cap  
+11. **Blend with base forecast** for final prediction  
+12. **Evaluate with sMAPE** (global and top-20)
+
+---
+
+This approach ensures **robustness, interpretability, and high accuracy**, combining **time series heuristics** with **machine learning residual correction**.
+
 
 ---
 
